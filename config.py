@@ -18,11 +18,12 @@ CRAWL4AI_TIMEOUT = 30
 # Search
 SEARCH_ENGINE = "duckduckgo"  # Free, no API key needed
 
-# News RSS Feeds
+# News RSS Feeds (working sources as of 2026)
 FASHION_RSS_FEEDS = [
-    "https://www.vogue.com/rss",
-    "https://www.harpersbazaar.com/rss",
     "https://www.wwd.com/rss",
     "https://www.businessoffashion.com/feed",
-    "https://www.thecut.com/rss",
+    # Add more Chinese fashion sources below
+    # "https://www.vogue.com/rss",
+    # "https://www.harpersbazaar.com/rss",
+    # "https://www.thecut.com/rss",
 ]
