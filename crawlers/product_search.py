@@ -1,217 +1,200 @@
-"""Product search from public fashion brand websites (no API keys needed).
-Searches ZARA, UNIQLO, H&M category pages for real product data with links, prices, and images."""
+"""Multi-source fashion product search engine (no API keys, 100% public data).
+Supports: ZARA, H&M, and web-based product discovery via DuckDuckGo + direct page scraping."""
 import asyncio
 import re
 import json
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 from crawl4ai import AsyncWebCrawler, BrowserConfig
 
-# Public brand category page URLs
-BRAND_CATEGORIES = {
-    "zara_dresses": "https://www.zara.cn/cn/zh/%E5%A5%B3%E5%A3%AB-%E9%80%A3%E8%BA%AB%E8%A3%99-l1066.html",
-    "zara_tops": "https://www.zara.cn/cn/zh/%E5%A5%B3%E5%A3%AB-%E4%B8%8A%E8%A1%A3-l1322.html",
-    "uniqlo_dresses": "https://www.uniqlo.cn/zh_CN/%E5%A5%B3%E8%A3%85/%E8%BF%9E%E8%A1%A3%E8%A3%99.html",
-    "hm_dresses": "https://www2.hm.com/zh_cn/women/products/dresses.html",
+
+# ─── ZARA ───────────────────────────────────────────────────────────
+
+ZARA_CATEGORY_URLS = {
+    "连衣裙": "https://www.zara.cn/cn/zh/%E5%A5%B3%E5%A3%AB-%E9%80%A3%E8%BA%AB%E8%A3%99-l1066.html",
+    "上衣":   "https://www.zara.cn/cn/zh/%E5%A5%B3%E5%A3%AB-%E4%B8%8A%E8%A1%A3-l1322.html",
+    "外套":   "https://www.zara.cn/cn/zh/%E5%A5%B3%E5%A3%AB-%E5%A4%96%E5%A5%97-l1202.html",
+    "裤子":   "https://www.zara.cn/cn/zh/%E5%A5%B3%E5%A3%AB-%E8%A4%B2%E5%AD%90-l1355.html",
 }
 
-
-def extract_product_name(url: str) -> str:
-    """Extract Chinese product name from ZARA URL."""
-    # URL format: https://www.zara.cn/cn/zh/产品名-pXXX.html
-    match = re.search(r'/([^/]+)-p\d+\.html', url)
-    if match:
-        name_encoded = match.group(1)
-        try:
-            return unquote(name_encoded)
-        except:
-            return name_encoded
-    return ""
-
-
-async def scrape_zara_category(url: str) -> list[dict]:
-    """Scrape ZARA category page for product listings."""
+async def _scrape_zara(url: str) -> list[dict]:
+    """Scrape products from a ZARA category page."""
     products = []
-    
     async with AsyncWebCrawler() as crawler:
-        result = await crawler.arun(
-            url,
-            word_count_threshold=10,
-            bypass_cache=True,
-            magic=True
-        )
-        
+        result = await crawler.arun(url, word_count_threshold=10, bypass_cache=True, magic=True)
         html = result.html or ""
-        
-        # Extract product URLs with names
-        # ZARA format: https://www.zara.cn/cn/zh/name-pXXXXX.html
-        product_matches = re.findall(
-            r'(https://www\.zara\.cn/cn/zh/[^\s\"\\<>]*?-p\d+[^\s\"\\<>]*?\.html)',
+        # Extract product URLs with names and prices
+        matches = re.findall(
+            r'(https://www\.zara\.cn/cn/zh/([^/]*?)-p\d+[^\s\"\\<>]*?\.html).*?',
             html
         )
-        
-        # Extract all prices
         prices = re.findall(r'¥[\s]*([\d,]+\.?\d*)', html)
-        
-        seen_urls = set()
-        for i, url in enumerate(product_matches):
-            url = url.split('?')[0]  # Clean URL
-            if url not in seen_urls:
-                seen_urls.add(url)
-                name = extract_product_name(url)
-                price = prices[i] if i < len(prices) else ""
-                
-                products.append({
-                    "title": name,
-                    "url": url,
-                    "price": f"¥{price}" if price else "见商品页",
-                    "brand": "ZARA",
-                    "source": "zara.cn",
-                    "category": "女装连衣裙",
-                    "image_url": "",  # Will get from product page
-                })
-    
+        seen = set()
+        for i, (full_url, name_enc) in enumerate(matches):
+            url = full_url.split('?')[0]
+            if url in seen: continue
+            seen.add(url)
+            try:
+                name = unquote(name_enc)
+            except:
+                name = name_enc
+            price = f"¥{prices[i]}" if i < len(prices) else "见商品页"
+            products.append({
+                "title": name, "url": url, "price": price,
+                "brand": "ZARA", "source": "zara.cn",
+            })
     return products
 
 
-async def scrape_uniqlo_category(url: str) -> list[dict]:
-    """Scrape UNIQLO category page."""
+# ─── H&M ────────────────────────────────────────────────────────────
+
+HM_BASE = "https://www2.hm.com"
+
+async def _scrape_hm(category_path: str = "women/products/dresses.html") -> list[dict]:
+    """Scrape H&M product listings. H&M loads data via JS, so we extract
+    product IDs from listing page, then scrape each detail page."""
     products = []
-    
     async with AsyncWebCrawler() as crawler:
         result = await crawler.arun(
-            url,
-            word_count_threshold=10,
-            bypass_cache=True,
+            f"{HM_BASE}/zh_cn/{category_path}",
+            word_count_threshold=10, bypass_cache=True, magic=True
         )
-        
-        md = result.markdown or ""
         html = result.html or ""
-        
-        # UNIQLO has simpler structure
-        # Look for product patterns in markdown
-        lines = [l.strip() for l in md.split('\n') if l.strip()]
-        
-        for line in lines:
-            # Skip navigation/UI
-            if len(line) < 10 or line.startswith('[') or line.startswith('*'):
-                continue
-            # Look for product price with ¥
-            if '¥' in line or '￥' in line:
-                price_match = re.search(r'[¥￥]\s*[\d,]+', line)
-                if price_match:
-                    # Extract URL from the line
-                    url_match = re.search(r'https?://[^\s\)\]>\'\"\[\]]+', line)
-                    if url_match:
-                        products.append({
-                            "title": line.replace(price_match.group(0), '').strip()[:60],
-                            "url": url_match.group(0).split('?')[0],
-                            "price": price_match.group(0),
-                            "brand": "UNIQLO",
-                            "source": "uniqlo.cn",
-                            "image_url": "",
-                        })
-        
-        # Also try to find product URLs in HTML
-        if len(products) < 5:
-            product_urls = re.findall(
-                r'(https://www\.uniqlo\.cn/[^\s\"\\<>]*?(?:product|goods)[^\s\"\\<>]*?\.html)',
-                html
-            )
-            for url in product_urls:
-                name_match = re.search(r'/([^/]+?)\.html', url)
-                name = name_match.group(1) if name_match else ""
+        # Extract product IDs
+        ids = re.findall(r'id=(\d+)', html)
+        seen_ids = set()
+        for pid in ids:
+            if pid in seen_ids: continue
+            seen_ids.add(pid)
+            detail_url = f"{HM_BASE}/items/espier-detail?id={pid}"
+            try:
+                detail = await crawler.arun(detail_url, word_count_threshold=10, bypass_cache=True)
+                detail_html = detail.html or ""
+                # Extract product name from HTML title/meta
+                title = ""
+                t_match = re.search(r'<title>([^<]+)</title>', detail_html)
+                if t_match: title = t_match.group(1).split('|')[0].strip()
+                # Extract price
+                price_match = re.search(r'(?:¥|￥|价格)\s*([\d,.]+)', detail_html)
+                price = f"¥{price_match.group(1)}" if price_match else "见商品页"
+                # Extract image
+                img_match = re.search(r'(https://[^\"\\<> ]*?hm\.com[^\"\\<> ]*?product[^\"\\<> ]*?\.(?:jpg|png|webp)[^\"]*)', detail_html)
+                img_url = img_match.group(1) if img_match else ""
                 products.append({
-                    "title": name.replace('-', ' ').title()[:60],
-                    "url": url.split('?')[0],
-                    "price": "见商品页",
-                    "brand": "UNIQLO",
-                    "source": "uniqlo.cn",
-                    "image_url": "",
+                    "title": title or f"H&M商品 #{pid}",
+                    "url": detail_url,
+                    "price": price,
+                    "brand": "H&M",
+                    "source": "hm.com",
+                    "image_url": img_url,
                 })
-    
+            except Exception:
+                continue
+            if len(products) >= 10: break
     return products
 
 
-async def search_fashion_products(keyword: str, max_products: int = 20) -> list[dict]:
-    """Search for fashion products across brand websites.
-    Maps keyword to appropriate brand categories and scrapes them."""
+# ─── Web Search (DuckDuckGo) ───────────────────────────────────────
+
+async def _web_search_products(keyword: str, max_results: int = 15) -> list[dict]:
+    """Search for products across the web using DuckDuckGo.
+    Returns product-like results with URLs, titles, and snippets."""
+    import time
+    from duckduckgo_search import DDGS
+    
+    products = []
+    queries = [
+        f"{keyword} 购买",
+        f"{keyword} 新款 2026",
+    ]
+    
+    for query in queries:
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=5))
+                for r in results:
+                    url = r.get('href', '')
+                    title = r.get('title', '')
+                    body = r.get('body', '')
+                    # Only include URLs that look like product pages
+                    if any(k in url.lower() for k in ['.com', '.cn', '.shop', '.store']):
+                        # Skip known non-product domains
+                        if any(skip in url.lower() for skip in ['facebook', 'instagram', 'twitter', 'youtube', 'pinterest', 'zhihu']):
+                            continue
+                        products.append({
+                            "title": title.strip()[:80],
+                            "url": url,
+                            "price": "见商品页",
+                            "brand": "全网",
+                            "source": url.split('/')[2] if '//' in url else "web",
+                            "snippet": body.strip()[:120] if body else "",
+                        })
+            time.sleep(1)  # Rate limit
+        except Exception as e:
+            print(f"    DDGS error: {e}")
+            continue
+    
+    return products[:max_results]
+
+
+# ─── Main Search ───────────────────────────────────────────────────
+
+async def search_products(keyword: str, max_total: int = 30) -> list[dict]:
+    """Search for products from ALL sources: ZARA, H&M, and web search.
+    Returns list of {title, url, price, brand, source, image_url}"""
     all_products = []
     
-    # Determine which categories to search based on keyword
-    targets = []
-    if any(k in keyword for k in ['连衣裙', 'dress', '裙']):
-        targets = ["zara_dresses", "uniqlo_dresses", "hm_dresses"]
-    elif any(k in keyword for k in ['上衣', 'top', 'shirt', '衬衫']):
-        targets = ["zara_tops"]
-    else:
-        targets = ["zara_dresses", "zara_tops"]
+    print(f"\n📦 Multi-source product search: {keyword}")
     
-    for target in targets:
-        url = BRAND_CATEGORIES.get(target)
-        if not url:
-            continue
-        
-        print(f"  Scraping {target}...")
-        try:
-            if target.startswith("zara"):
-                products = await scrape_zara_category(url)
-            elif target.startswith("uniqlo"):
-                products = await scrape_uniqlo_category(url)
-            else:
-                products = []
-            
-            print(f"    Found {len(products)} products")
-            all_products.extend(products)
-        except Exception as e:
-            print(f"    Error: {e}")
-        
-        if len(all_products) >= max_products:
-            break
+    # 1. ZARA
+    category = "连衣裙" if any(k in keyword for k in ["裙", "dress", "连衣裙"]) else \
+               "上衣" if any(k in keyword for k in ["上衣", "top", "shirt", "衬衫"]) else \
+               "外套" if any(k in keyword for k in ["外套", "jacket", "夹克"]) else None
+    if category:
+        url = ZARA_CATEGORY_URLS.get(category)
+        if url:
+            print(f"  🔴 ZARA ({category})...")
+            try:
+                prods = await _scrape_zara(url)
+                all_products.extend(prods)
+                print(f"    → {len(prods)} products")
+            except Exception as e:
+                print(f"    → Error: {e}")
+    
+    # 2. H&M
+    print(f"  🟡 H&M...")
+    try:
+        hm_products = await _scrape_hm()
+        all_products.extend(hm_products)
+        print(f"    → {len(hm_products)} products")
+    except Exception as e:
+        print(f"    → Error: {e}")
+    
+    # 3. Web Search
+    print(f"  🔵 Web search...")
+    try:
+        web_products = await _web_search_products(keyword)
+        all_products.extend(web_products)
+        print(f"    → {len(web_products)} products")
+    except Exception as e:
+        print(f"    → Error: {e}")
     
     # Deduplicate
     seen = set()
     unique = []
     for p in all_products:
-        if p['url'] not in seen:
-            seen.add(p['url'])
+        key = p.get('url', '')[:80]
+        if key and key not in seen:
+            seen.add(key)
             unique.append(p)
     
-    return unique[:max_products]
+    print(f"\n  📊 Total: {len(unique)} unique products from {len(set(p['source'] for p in unique))} sources")
+    return unique[:max_total]
 
 
-async def search_product_images(keyword: str, max_images: int = 10) -> list[str]:
-    """Search for product images using Bing image search via Crawl4AI."""
-    images = []
-    
-    encoded = keyword
-    async with AsyncWebCrawler() as crawler:
-        result = await crawler.arun(
-            f"https://www.bing.com/images/search?q={encoded}&form=HDRSC2",
-            word_count_threshold=10,
-            bypass_cache=True,
-        )
-        
-        html = result.html or ""
-        # Extract image URLs from Bing results
-        img_urls = re.findall(
-            r'(https?://[^\s\"\\<>]*?\.(?:jpg|jpeg|png|webp)(?:\?[^\s\"\\<>]*?)?)',
-            html
-        )
-        
-        for url in img_urls:
-            # Filter out small/thumnail images
-            if any(d in url for d in ['th.bing.com', 'ts=1', 'sig=']):
-                continue
-            if url not in images:
-                images.append(url)
-            if len(images) >= max_images:
-                break
-    
-    return images
+# ─── DeepSeek Analysis ────────────────────────────────────────────
 
-
-def analyze_products_with_deepseek(products: list[dict], keyword: str) -> dict:
-    """Use DeepSeek to analyze scraped product data and generate trend report."""
+def analyze_with_deepseek(products: list[dict], keyword: str) -> dict:
+    """Analyze real product data with DeepSeek."""
     from openai import OpenAI
     from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL
     import os
@@ -222,29 +205,31 @@ def analyze_products_with_deepseek(products: list[dict], keyword: str) -> dict:
     
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     
-    # Build product summary for analysis
-    product_summaries = []
-    for p in products[:15]:
-        product_summaries.append(f"- {p['title']} | 品牌: {p['brand']} | 价格: {p['price']}")
+    # Build product summary
+    summaries = []
+    sources = set()
+    for p in products[:20]:
+        summaries.append(f"- [{p['brand']}] {p['title']} | {p['price']}")
+        sources.add(p['brand'])
     
-    prompt = f"""你是服装行业数据分析师。基于以下从ZARA、UNIQLO等品牌官网采集的"{keyword}"真实商品数据，做趋势分析。
+    prompt = f"""你是服装行业数据分析师。基于以下从多个来源（{', '.join(sources)}）采集的"{keyword}"真实商品数据，做市场趋势分析。
 
-真实商品数据：
-{chr(10).join(product_summaries)}
+真实商品数据（含品牌、名称、价格、链接）：
+{chr(10).join(summaries)}
 
-请分析并用JSON格式回复（不要markdown）：
+请用JSON格式回复（不要markdown）：
 {{
   "keyword": "{keyword}",
   "total_products": {len(products)},
+  "data_sources": {json.dumps(list(sources))},
   "price_range": "价格区间",
   "top_styles": ["风格1 - 占比%", "风格2 - 占比%"],
-  "top_colors": [{{"name":"颜色","hex":"#十六进制","percentage":"占比%"}}],
-  "top_brands": [{{"name":"品牌名","position":"定位"}}],
+  "top_brands": [{{"name":"品牌","source":"数据来源","note":"特点"}}],
   "trend_direction": "上升|下降|稳定",
   "key_insight": "关键洞察50字",
-  "suggestions": ["建议1","建议2"],
+  "suggestions": ["建议1","建议2","建议3"],
   "sample_products": [
-    {{"title":"商品名","price":"价格","url":"商品链接"}}
+    {{"title":"商品名","price":"价格","url":"链接","brand":"品牌"}}
   ]
 }}"""
 
@@ -252,63 +237,66 @@ def analyze_products_with_deepseek(products: list[dict], keyword: str) -> dict:
         response = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=2000,
+            temperature=0.3, max_tokens=2000,
         )
         content = response.choices[0].message.content
-        # Clean markdown code blocks if present
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0]
         elif "```" in content:
             content = content.split("```")[1].split("```")[0]
         return json.loads(content.strip())
     except Exception as e:
-        print(f"DeepSeek error: {e}")
-        return {"error": str(e), "keyword": keyword, "total_products": len(products)}
+        return {"error": str(e), "keyword": keyword}
 
 
-async def run_trend_analysis(keyword: str) -> dict:
-    """Complete pipeline: search products → get images → DeepSeek analysis."""
-    print(f"\n{'='*50}")
-    print(f"🔍 QuisAI Trend Analysis: {keyword}")
-    print(f"{'='*50}")
-    
-    # Step 1: Search products from brand websites
-    print(f"\n📦 Step 1: Searching products...")
-    products = await search_fashion_products(keyword)
-    print(f"   Found {len(products)} real products")
-    
-    # Step 2: Get product images
-    print(f"\n🖼️  Step 2: Searching images...")
-    images = await search_product_images(keyword)
-    print(f"   Found {len(images)} images")
-    
-    # Step 3: DeepSeek analysis
-    print(f"\n🤖 Step 3: DeepSeek trend analysis...")
-    analysis = analyze_products_with_deepseek(products, keyword)
-    
-    return {
-        "keyword": keyword,
-        "products": products,
-        "images": images,
-        "analysis": analysis,
-        "product_count": len(products),
-        "image_count": len(images),
-    }
+# ─── Image Search (Bing) ───────────────────────────────────────────
+
+async def search_product_images(keyword: str, max_images: int = 10) -> list[str]:
+    """Search for product images via Bing image search."""
+    images = []
+    async with AsyncWebCrawler() as crawler:
+        try:
+            result = await crawler.arun(
+                f"https://www.bing.com/images/search?q={keyword}&form=HDRSC2",
+                word_count_threshold=10, bypass_cache=True,
+            )
+            html = result.html or ""
+            # Extract image URLs
+            img_urls = re.findall(
+                r'(https?://[^\s"\\<>]*?\.(?:jpg|jpeg|png|webp)(?:\?[^\s"\\<>]*?)?)', html
+            )
+            for url in img_urls:
+                if any(skip in url for skip in ['th.bing.com', 'ts=1', 'sig=']):
+                    continue
+                if url not in images:
+                    images.append(url)
+                if len(images) >= max_images:
+                    break
+        except Exception as e:
+            print(f"Image search error: {e}")
+    return images
+
+
+# ─── Full Pipeline ────────────────────────────────────────────────
+
+async def run_analysis(keyword: str) -> dict:
+    """Full pipeline: search all sources → analyze → return results."""
+    products = await search_products(keyword)
+    analysis = analyze_with_deepseek(products, keyword)
+    return {"keyword": keyword, "products": products, "analysis": analysis,
+            "product_count": len(products), "source_count": len(set(p['source'] for p in products))}
 
 
 if __name__ == "__main__":
-    result = asyncio.run(run_trend_analysis("连衣裙"))
-    print("\n=== RESULTS ===")
-    print(f"Products: {result['product_count']}")
-    print(f"Images: {result['image_count']}")
-    if result['products']:
-        print("\nSample products:")
-        for p in result['products'][:5]:
-            print(f"  {p['price']:>10} | {p['title'][:40]} | {p['brand']}")
-    if isinstance(result.get('analysis'), dict) and not result['analysis'].get('error'):
-        print(f"\nAnalysis:")
-        a = result['analysis']
-        print(f"  价格区间: {a.get('price_range','?')}")
-        print(f"  趋势: {a.get('trend_direction','?')}")
-        print(f"  关键洞察: {a.get('key_insight','?')}")
+    result = asyncio.run(run_analysis("连衣裙"))
+    print("\n" + "="*60)
+    print(f"✅ Found {result['product_count']} products from {result['source_count']} sources")
+    a = result.get('analysis', {})
+    if isinstance(a, dict) and not a.get('error'):
+        print(f"📊 价格区间: {a.get('price_range','?')}")
+        print(f"📊 趋势: {a.get('trend_direction','?')}")
+        print(f"📊 洞察: {a.get('key_insight','?')}")
+        print("\n📦 商品清单:")
+        for p in result['products'][:10]:
+            print(f"  {p['price']:>10s} | {p['brand']:6s} | {p['title'][:40]}")
+            print(f"  {'':>10s}   {p['url'][:80]}")
